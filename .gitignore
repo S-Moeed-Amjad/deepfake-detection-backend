@@ -1,0 +1,3 @@
+echo -e "\n# virtualenv\nvenv/\n.venv/\n__pycache__/\n*.pyc\n.DS_Store\n" >> .gitignore
+git add .gitignore
+git commit -m "Ignore virtual environment"
