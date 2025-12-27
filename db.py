@@ -1,12 +1,19 @@
 import os
 from pymongo import MongoClient
 from pymongo.collection import Collection
+import certifi
 
-def get_client() -> MongoClient:
-    uri = os.getenv("MONGODB_URI", "").strip()
-    if not uri:
-        raise RuntimeError("Missing MONGODB_URI")
-    return MongoClient(uri)
+def get_client():
+    uri = os.environ["MONGODB_URI"]
+    return MongoClient(
+        uri,
+        tls=True,
+        tlsCAFile=certifi.where(),
+        serverSelectionTimeoutMS=20000,
+        connectTimeoutMS=20000,
+        socketTimeoutMS=20000,
+    )
+
 
 def get_collection() -> Collection:
     client = get_client()
