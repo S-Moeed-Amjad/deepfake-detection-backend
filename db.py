@@ -4,7 +4,7 @@ from pymongo.collection import Collection
 import certifi
 
 def get_client():
-    uri = os.environ["MONGODB_URI"]
+    uri = os.environ["mongodb+srv://syedmoeedamjad_db_user:Yolopolo123@deepfake.wnk5pzu.mongodb.net/?appName=deepfake"]
     return MongoClient(
         uri,
         tls=True,
