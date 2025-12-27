@@ -1,199 +1,241 @@
 import os
 import uuid
-import time
+import asyncio
 import tempfile
-from datetime import datetime
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from model_utils import DeepfakeDetector
-from db import get_collection
 from local_store import LocalStore
+from db_data_api import insert_result, find_result, delete_result
 
-load_dotenv()
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+APP_NAME = "Deepfake Detection API"
 
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
 MODEL_NAME = os.getenv("MODEL_NAME", "tf_efficientnet_b0.ns_jft_in1k")
-RESULT_TTL = int(os.getenv("RESULT_TTL", "300"))  # 5 minutes default
-RESULT_DIR = os.getenv("RESULT_DIR", "/tmp/deepfake_results")
 
-app = FastAPI(title="Deepfake Detection API (MongoDB + Temporary Files)")
+RESULT_TTL = int(os.getenv("RESULT_TTL", "300"))
+STORE_DIR = os.getenv("STORE_DIR", "/tmp/deepfake_results")
 
 # CORS
-allowed = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+origins = ["*"] if ALLOWED_ORIGINS.strip() in ("*", "") else [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+
+app = FastAPI(title=APP_NAME)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed if allowed != ["*"] else ["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-detector = None  # loaded at startup
-store = LocalStore(RESULT_DIR)
+detector: Optional[DeepfakeDetector] = None
+store = LocalStore(STORE_DIR)
 
-def _now_ts() -> float:
-    return time.time()
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
+
+def _is_image(filename: str, content_type: str) -> bool:
+    ext = os.path.splitext((filename or "").lower())[1]
+    if ext in IMAGE_EXTS:
+        return True
+    if content_type and content_type.startswith("image/"):
+        return True
+    return False
+
+def _is_video(filename: str, content_type: str) -> bool:
+    ext = os.path.splitext((filename or "").lower())[1]
+    if ext in VIDEO_EXTS:
+        return True
+    if content_type and content_type.startswith("video/"):
+        return True
+    return False
+
+async def _cleanup_loop():
+    while True:
+        try:
+            store.cleanup_older_than(RESULT_TTL)
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 @app.on_event("startup")
-def startup():
+async def startup():
     global detector
+    if not os.path.exists(MODEL_PATH):
+        raise RuntimeError(f"MODEL_PATH not found: {MODEL_PATH}")
     detector = DeepfakeDetector(model_path=MODEL_PATH, model_name=MODEL_NAME)
-
-    # Create TTL index (MongoDB deletes docs automatically after RESULT_TTL seconds)
-    coll = get_collection()
-    coll.create_index("created_at", expireAfterSeconds=RESULT_TTL)
+    asyncio.create_task(_cleanup_loop())
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model_loaded": detector is not None}
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    """Upload an image or video. Returns label, percentage, and a URL to fetch the heatmap output."""
+async def predict(request: Request, file: UploadFile = File(...)):
+    """Unified endpoint for image OR video.
+
+    Returns JSON:
+      - label: REAL/FAKE
+      - percentage: fake probability * 100
+      - job_id
+      - heatmap_url: URL to GET /result/{job_id}
+      - output_type: image/png or video/mp4
+    """
     if detector is None:
-        raise HTTPException(status_code=500, detail="Model not loaded.")
+        raise HTTPException(status_code=500, detail="Model not loaded")
 
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing filename")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty upload")
 
-    ext = os.path.splitext(file.filename.lower())[1]
-    content_type = (file.content_type or "").lower()
-    data = await file.read()
+    is_image = _is_image(file.filename or "", file.content_type or "")
+    is_video = _is_video(file.filename or "", file.content_type or "")
 
-    job_id = str(uuid.uuid4())
-    created_at = datetime.utcnow()
+    if not (is_image or is_video):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Upload an image or a video (.jpg/.png/.mp4 etc).")
 
-    # IMAGE
-    if ext in IMAGE_EXTS or content_type.startswith("image/"):
-        arr = np.frombuffer(data, dtype=np.uint8)
+    job_id = uuid.uuid4().hex
+
+    if is_image:
+        arr = np.frombuffer(content, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise HTTPException(status_code=400, detail="Invalid image file")
 
         result = detector.predict_image(img)
         if "error" in result:
-            return {"job_id": job_id, "type": "image", "label": "UNKNOWN", "percentage": None, "error": result["error"]}
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        overlay = result["overlay_bgr"]
+        ok, png = cv2.imencode(".png", overlay)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to encode output image")
+
+        out_path = store.make_path(job_id, "heatmap.png")
+        with open(out_path, "wb") as f:
+            f.write(png.tobytes())
 
         fake_prob = float(result["probability"])
         label = "FAKE" if fake_prob >= 0.5 else "REAL"
         percentage = round(fake_prob * 100.0, 2)
 
-        out_path = store.make_path(job_id, "heatmap.png")
-        ok, png = cv2.imencode(".png", result["overlay_bgr"])
-        if not ok:
-            raise HTTPException(status_code=500, detail="Failed to encode output image")
-        with open(out_path, "wb") as f:
-            f.write(png.tobytes())
-
-        coll = get_collection()
-        coll.insert_one({
-            "job_id": job_id,
-            "type": "image",
-            "label": label,
-            "fake_probability": fake_prob,
-            "percentage": percentage,
-            "output_path": out_path,
-            "mime": "image/png",
-            "created_at": created_at,
-        })
-
-        return {
-            "job_id": job_id,
-            "type": "image",
-            "label": label,
-            "percentage": percentage,
-            "fake_probability": round(fake_prob, 6),
-            "heatmap_url": f"/result/{job_id}",
-            "expires_in_seconds": RESULT_TTL
-        }
-
-    # VIDEO
-    if ext in VIDEO_EXTS or content_type.startswith("video/"):
-        suffix = ext if ext else ".mp4"
-        in_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        in_path = in_tmp.name
-        in_tmp.close()
-        with open(in_path, "wb") as f:
-            f.write(data)
-
-        out_path = store.make_path(job_id, "heatmap.mp4")
-
+        # Store metadata in Atlas Data API (best-effort; don't block user if it fails)
         try:
-            summary = detector.predict_video(in_path, out_path, sample_every=1)
-        except Exception as e:
-            try:
-                os.remove(in_path)
-            except Exception:
-                pass
-            store.delete_path(out_path)
-            raise HTTPException(status_code=500, detail=f"Video processing failed: {e}")
-
-        try:
-            os.remove(in_path)
+            await insert_result({
+                "job_id": job_id,
+                "label": label,
+                "percentage": percentage,
+                "output_type": "image/png",
+                "output_path": out_path,
+                "ttl_seconds": RESULT_TTL,
+            })
         except Exception:
             pass
 
-        avg_fake_prob = float(summary["avg_probability"])
-        label = "FAKE" if avg_fake_prob >= 0.5 else "REAL"
-        percentage = round(avg_fake_prob * 100.0, 2)
-
-        coll = get_collection()
-        coll.insert_one({
-            "job_id": job_id,
-            "type": "video",
-            "label": label,
-            "fake_probability": avg_fake_prob,
-            "percentage": percentage,
-            "frames_scored": int(summary.get("frames_scored", 0)),
-            "output_path": out_path,
-            "mime": "video/mp4",
-            "created_at": created_at,
-        })
-
+        base = str(request.base_url).rstrip("/")
         return {
             "job_id": job_id,
-            "type": "video",
             "label": label,
             "percentage": percentage,
-            "fake_probability": round(avg_fake_prob, 6),
-            "frames_scored": int(summary.get("frames_scored", 0)),
-            "heatmap_url": f"/result/{job_id}",
-            "expires_in_seconds": RESULT_TTL
+            "output_type": "image/png",
+            "heatmap_url": f"{base}/result/{job_id}",
         }
 
-    raise HTTPException(status_code=400, detail="Unsupported file type. Upload an image or a video.")
+    # video
+    in_fd, in_path = tempfile.mkstemp(suffix=os.path.splitext(file.filename or "")[1] or ".mp4")
+    os.close(in_fd)
+    with open(in_path, "wb") as f:
+        f.write(content)
+
+    out_path = store.make_path(job_id, "heatmap.mp4")
+    try:
+        summary = detector.predict_video(in_path=in_path, out_path=out_path, sample_every=int(os.getenv("VIDEO_SAMPLE_EVERY","1")))
+    except Exception as e:
+        try: os.remove(in_path)
+        except Exception: pass
+        raise HTTPException(status_code=500, detail=f"Video processing failed: {e}")
+
+    try:
+        os.remove(in_path)
+    except Exception:
+        pass
+
+    avg_prob = float(summary.get("avg_probability", 0.0))
+    label = "FAKE" if avg_prob >= 0.5 else "REAL"
+    percentage = round(avg_prob * 100.0, 2)
+
+    try:
+        await insert_result({
+            "job_id": job_id,
+            "label": label,
+            "percentage": percentage,
+            "output_type": "video/mp4",
+            "output_path": out_path,
+            "frames_scored": int(summary.get("frames_scored", 0)),
+            "ttl_seconds": RESULT_TTL,
+        })
+    except Exception:
+        pass
+
+    base = str(request.base_url).rstrip("/")
+    return {
+        "job_id": job_id,
+        "label": label,
+        "percentage": percentage,
+        "output_type": "video/mp4",
+        "frames_scored": int(summary.get("frames_scored", 0)),
+        "heatmap_url": f"{base}/result/{job_id}",
+    }
 
 @app.get("/result/{job_id}")
-def get_result(job_id: str):
-    coll = get_collection()
-    doc = coll.find_one({"job_id": job_id})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Result not found or expired.")
+async def result(job_id: str):
+    # Prefer DB metadata if available; otherwise fall back to local store paths.
+    doc = None
+    try:
+        doc = await find_result(job_id)
+    except Exception:
+        doc = None
 
-    created_at = doc.get("created_at")
-    if created_at is not None:
-        age = _now_ts() - created_at.timestamp()
-        if age > RESULT_TTL:
+    candidates = []
+    if doc and isinstance(doc, dict) and doc.get("output_path"):
+        candidates.append(doc["output_path"])
+    candidates.append(store.make_path(job_id, "heatmap.mp4"))
+    candidates.append(store.make_path(job_id, "heatmap.png"))
+
+    path = next((p for p in candidates if p and os.path.exists(p)), None)
+    if not path:
+        # best-effort cleanup DB record
+        try:
+            await delete_result(job_id)
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail="Result not found or expired")
+
+    # Enforce TTL based on file mtime
+    age = (asyncio.get_event_loop().time())
+    try:
+        import time
+        if (time.time() - os.path.getmtime(path)) > RESULT_TTL:
             try:
-                store.delete_path(doc.get("output_path", ""))
+                os.remove(path)
             except Exception:
                 pass
-            coll.delete_one({"job_id": job_id})
-            raise HTTPException(status_code=404, detail="Result expired.")
+            try:
+                await delete_result(job_id)
+            except Exception:
+                pass
+            raise HTTPException(status_code=404, detail="Result expired")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
-    path = doc.get("output_path")
-    mime = doc.get("mime", "application/octet-stream")
-    if not path or not store.exists(path):
-        coll.delete_one({"job_id": job_id})
-        raise HTTPException(status_code=404, detail="File not found (expired).")
-
-    return FileResponse(path, media_type=mime, filename=os.path.basename(path))
+    mime = "video/mp4" if path.lower().endswith(".mp4") else "image/png"
+    return FileResponse(path, media_type=mime, headers={"Content-Disposition": "inline"})

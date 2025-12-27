@@ -33,3 +33,17 @@ Set env vars:
 - `MODEL_PATH=best.pt` (included in repo)
 - `RESULT_TTL=300`
 # deepfake-detection-backend
+
+
+## Atlas Data API (recommended on Render)
+Set these env vars on Render (avoids TLS issues on port 27017):
+- MONGO_DATA_API_APP_ID
+- MONGO_DATA_API_KEY
+- MONGO_DATA_API_DATA_SOURCE
+- MONGO_DB=deepfake
+- MONGO_COLLECTION=results
+- RESULT_TTL=300
+- ALLOWED_ORIGINS=<your Netlify URL>
+- MODEL_PATH=best.pt
+
+The API returns JSON from POST /predict with heatmap_url. The heatmap file is stored temporarily under /tmp and is cleaned up after RESULT_TTL.
