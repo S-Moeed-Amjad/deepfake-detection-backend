@@ -1,15 +1,11 @@
-# Backend (FastAPI) — MongoDB (TTL) + Temporary Heatmap Files
+# Deepfake Backend (FastAPI) — No DB, Serve-once Results
 
 ## Endpoints
-- `POST /predict` (multipart/form-data, field: `file`)  
-  Returns JSON: `label`, `percentage`, and `heatmap_url`.
+- `POST /predict` (multipart field: `file`)  
+  Returns JSON with `label`, `percentage`, and `result_url`.
 
 - `GET /result/{job_id}`  
-  Streams the heatmap output (PNG or MP4). Expires after `RESULT_TTL` seconds.
-
-## Auto-expiry (5 minutes)
-- MongoDB TTL index deletes metadata automatically (not instantaneous).
-- `/result/{job_id}` also enforces TTL and removes expired file + record on access.
+  Streams the heatmap output (PNG/MP4). If `SERVE_ONCE=1`, it deletes the output immediately after serving.
 
 ## Local run
 ```bash
@@ -18,8 +14,6 @@ source venv/bin/activate
 python -m pip install -r requirements.txt
 
 cp .env.example .env
-# edit .env to set MONGODB_URI
-
 python -m uvicorn app:app --reload --port 8000
 ```
 
@@ -27,23 +21,5 @@ Swagger:
 - http://localhost:8000/docs
 
 ## Deploy on Render
-Set env vars:
-- `MONGODB_URI`
-- `ALLOWED_ORIGINS` (your Netlify URL)
-- `MODEL_PATH=best.pt` (included in repo)
-- `RESULT_TTL=300`
-# deepfake-detection-backend
-
-
-## Atlas Data API (recommended on Render)
-Set these env vars on Render (avoids TLS issues on port 27017):
-- MONGO_DATA_API_APP_ID
-- MONGO_DATA_API_KEY
-- MONGO_DATA_API_DATA_SOURCE
-- MONGO_DB=deepfake
-- MONGO_COLLECTION=results
-- RESULT_TTL=300
-- ALLOWED_ORIGINS=<your Netlify URL>
-- MODEL_PATH=best.pt
-
-The API returns JSON from POST /predict with heatmap_url. The heatmap file is stored temporarily under /tmp and is cleaned up after RESULT_TTL.
+- Set `ALLOWED_ORIGINS` to your Netlify domain.
+- Render filesystem is ephemeral, which is perfect for temporary results.
