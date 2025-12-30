@@ -1,3 +1,27 @@
-echo -e "\n# virtualenv\nvenv/\n.venv/\n__pycache__/\n*.pyc\n.DS_Store\n" >> .gitignore
-git add .gitignore
-git commit -m "Ignore virtual environment"
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.DS_Store
+
+# Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Local env vars
+.env
+
+# Model files (optional — keep if you want to store model in repo)
+# *.pt
+# *.pth
+
+# Outputs
+/tmp/
+outputs/
+EOF
