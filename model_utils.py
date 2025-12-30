@@ -235,5 +235,5 @@ class DeepfakeDetector:
         writer.release()
 
         avg_prob = float(np.mean(probs)) if len(probs) else 0.0
-        label = "FAKE" if avg_prob >= 0.5 else "REAL"
+        label = "FAKE" if avg_prob >= 0.4 else "REAL"
         return {"label": label, "avg_probability": avg_prob, "frames_scored": len(probs)}
