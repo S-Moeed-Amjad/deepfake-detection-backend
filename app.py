@@ -186,3 +186,15 @@ def download(job_id: str):
         media_type=mime or "application/octet-stream",
         filename=out_path.name,
     )
+@app.delete("/delete/{job_id}")
+def delete_job(job_id: str):
+    candidates = [
+        OUT_DIR / f"{job_id}_heatmap.mp4",
+        OUT_DIR / f"{job_id}_heatmap.png",
+    ]
+    deleted = False
+    for p in candidates:
+        if p.exists():
+            p.unlink(missing_ok=True)
+            deleted = True
+    return {"ok": True, "deleted": deleted}
