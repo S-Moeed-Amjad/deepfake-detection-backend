@@ -550,21 +550,31 @@ class DeepfakeDetector:
             cap.release()
             raise RuntimeError("Invalid video dimensions from input.")
 
+        # ---- HARD CAPS (prevents 502 on Render) ----
+        max_seconds = int(os.getenv("MAX_VIDEO_SECONDS", "10"))
+        max_frames_env = int(os.getenv("MAX_VIDEO_FRAMES", "140"))
+        max_frames_by_time = int(fps * max_seconds)
+        max_total_frames = max(1, min(max_frames_env, max_frames_by_time))
+
+        # ---- Compute Grad-CAM less frequently ----
+        cam_every = int(os.getenv("CAM_EVERY", "8"))  # compute CAM once every N inference steps
+        cam_every = max(1, cam_every)
+
         # Write to AVI (reliable), then transcode to MP4 (H.264)
         tmp_out = out_path.replace(".mp4", "._tmp.avi")
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         writer = cv2.VideoWriter(tmp_out, fourcc, fps, (W, H))
-
         if not writer.isOpened():
             cap.release()
             raise RuntimeError("VideoWriter failed to open (MJPG/AVI). Cannot write output.")
 
         probs = []
         frame_idx = 0
+        infer_steps = 0  # counts how many times we did inference (sampled frames)
 
         # ---- Flicker control knobs ----
         alpha_prob = float(os.getenv("SMOOTH_PROB_ALPHA", "0.90"))
-        alpha_cam  = float(os.getenv("SMOOTH_CAM_ALPHA", "0.85"))
+        alpha_cam = float(os.getenv("SMOOTH_CAM_ALPHA", "0.85"))
         hold_frames = int(os.getenv("HOLD_FACE_FRAMES", "6"))
         min_iou_keep = float(os.getenv("MIN_IOU_KEEP", "0.20"))
 
@@ -579,79 +589,107 @@ class DeepfakeDetector:
 
         wrote_any = False
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        try:
+            while True:
+                # Stop early to avoid timeouts/OOM
+                if frame_idx >= max_total_frames:
+                    break
 
-            out = frame.copy()
-            do_infer = (frame_idx % sample_every == 0)
+                ok, frame = cap.read()
+                if not ok:
+                    break
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                out = frame.copy()
+                do_infer = (frame_idx % sample_every == 0)
 
-            box = None
-            if do_infer:
-                det = self.detect_face_box(rgb)
-                if det is not None:
-                    cb = clamp_box(*det, W, H)
-                    if cb is not None and last_box is not None:
-                        if iou(cb, last_box) < min_iou_keep:
-                            cb = last_box
-                        box = cb
-                    else:
-                        box = cb
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                if box is None and last_box is not None and last_box_ttl > 0:
-                    box = last_box
-            else:
-                if last_box is not None and last_box_ttl > 0:
-                    box = last_box
+                # ---- Face box logic with hold + jump rejection ----
+                box = None
+                if do_infer:
+                    det = self.detect_face_box(rgb)
+                    if det is not None:
+                        cb = clamp_box(*det, W, H)
+                        if cb is not None and last_box is not None:
+                            if iou(cb, last_box) < min_iou_keep:
+                                cb = last_box
+                            box = cb
+                        else:
+                            box = cb
 
-            if box is not None:
-                last_box = box
-                last_box_ttl = hold_frames
-            else:
-                last_box_ttl = max(0, last_box_ttl - 1)
+                    if box is None and last_box is not None and last_box_ttl > 0:
+                        box = last_box
+                else:
+                    if last_box is not None and last_box_ttl > 0:
+                        box = last_box
 
-            if box is not None:
-                x1, y1, x2, y2 = box
-                face = rgb[y1:y2, x1:x2]
+                if box is not None:
+                    last_box = box
+                    last_box_ttl = hold_frames
+                else:
+                    last_box_ttl = max(0, last_box_ttl - 1)
 
-                if face.size != 0:
-                    if do_infer:
-                        face224 = cv2.resize(face, (224, 224))
-                        prob, cam = self.predict_face_frame(face224)
-                        probs.append(prob)
+                # ---- Inference / overlay ----
+                if box is not None:
+                    x1, y1, x2, y2 = box
+                    face = rgb[y1:y2, x1:x2]
 
-                        ema_prob = prob if ema_prob is None else (alpha_prob * ema_prob + (1 - alpha_prob) * prob)
-                        cam_ema  = cam  if cam_ema  is None else (alpha_cam  * cam_ema  + (1 - alpha_cam)  * cam)
+                    if face.size != 0:
+                        if do_infer:
+                            infer_steps += 1
+                            face224 = cv2.resize(face, (224, 224))
 
-                        if verdict == "REAL" and ema_prob >= fake_on:
-                            verdict = "FAKE"
-                        elif verdict == "FAKE" and ema_prob <= real_on:
-                            verdict = "REAL"
+                            # Compute CAM only every cam_every steps (BIG speedup)
+                            do_cam = (infer_steps % cam_every == 1)  # 1, 1+cam_every, ...
 
-                    if cam_ema is not None:
-                        face224_for_overlay = cv2.resize(face, (224, 224))
-                        heat224 = overlay_heatmap(face224_for_overlay, cam_ema)
+                            if do_cam:
+                                # heavy path: prob + cam (backward pass)
+                                prob, cam = self.predict_face_frame(face224)
+                                # Smooth cam
+                                cam_ema = cam if cam_ema is None else (alpha_cam * cam_ema + (1 - alpha_cam) * cam)
+                            else:
+                                # cheap path: prob only (forward pass)
+                                x = self.tf(face224).unsqueeze(0).to(self.device)
+                                with torch.no_grad():
+                                    logits = self.model(x).squeeze(1)
+                                    prob = float(torch.sigmoid(logits).item())
+                                cam = None  # keep previous cam_ema (sticky heatmap)
 
-                        roi = out[y1:y2, x1:x2]
-                        rh, rw = roi.shape[:2]
-                        heat_resized = cv2.resize(heat224, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                        out[y1:y2, x1:x2] = heat_resized
+                            probs.append(prob)
 
-            draw_verdict_only(out, verdict, anchor=(20, 50))
+                            # Smooth probability
+                            ema_prob = prob if ema_prob is None else (alpha_prob * ema_prob + (1 - alpha_prob) * prob)
 
-            # Ensure consistent size
-            if out.shape[1] != W or out.shape[0] != H:
-                out = cv2.resize(out, (W, H), interpolation=cv2.INTER_LINEAR)
+                            # Stable verdict via hysteresis
+                            if verdict == "REAL" and ema_prob >= fake_on:
+                                verdict = "FAKE"
+                            elif verdict == "FAKE" and ema_prob <= real_on:
+                                verdict = "REAL"
 
-            writer.write(out)
-            wrote_any = True
-            frame_idx += 1
+                        # Apply the LAST cam_ema (sticky)
+                        if cam_ema is not None:
+                            face224_for_overlay = cv2.resize(face, (224, 224))
+                            heat224 = overlay_heatmap(face224_for_overlay, cam_ema)
 
-        cap.release()
-        writer.release()
+                            roi = out[y1:y2, x1:x2]
+                            rh, rw = roi.shape[:2]
+                            heat_resized = cv2.resize(heat224, (rw, rh), interpolation=cv2.INTER_LINEAR)
+                            out[y1:y2, x1:x2] = heat_resized
+
+                # Verdict only
+                draw_verdict_only(out, verdict, anchor=(20, 50))
+
+                # Ensure size
+                if out.shape[1] != W or out.shape[0] != H:
+                    out = cv2.resize(out, (W, H), interpolation=cv2.INTER_LINEAR)
+
+                writer.write(out)
+                wrote_any = True
+                frame_idx += 1
+
+        finally:
+            cap.release()
+            writer.release()
 
         if not wrote_any:
             try:
