@@ -19,11 +19,14 @@ load_dotenv()
 
 # ===== Config =====
 RESULT_TTL = int(os.getenv("RESULT_TTL", "300"))  # seconds
-ALLOWED_ORIGINS = [
-    o.strip()
-    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
-    if o.strip()
-]
+
+# If ALLOWED_ORIGINS is missing/empty or "*", allow all origins.
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "*").strip()
+if not _raw_origins or _raw_origins == "*":
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
 
 TMP_DIR = Path("/tmp/deepfake")
@@ -37,11 +40,12 @@ app = FastAPI(title="Deepfake Detector API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # MUST be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 detector: Optional[DeepfakeDetector] = None
 
 
@@ -118,19 +122,16 @@ async def predict(file: UploadFile = File(...), sample_every: int = 5):
     out_ext = ".mp4" if is_vid else ".png"
     out_path = OUT_DIR / f"{job_id}_heatmap{out_ext}"
 
-    # Save upload to /tmp
     data = await file.read()
     in_path.write_bytes(data)
 
     try:
         if is_vid:
-            # Video path -> produce heatmap MP4
             result = detector.predict_video(str(in_path), str(out_path), sample_every=sample_every)
             prob = float(result["avg_probability"])
             label = result["label"]
             output_type = "video/mp4"
         else:
-            # Image -> produce heatmap PNG
             bgr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if bgr is None:
                 raise RuntimeError("Could not decode image")
@@ -143,7 +144,6 @@ async def predict(file: UploadFile = File(...), sample_every: int = 5):
             label = result["label"]
             output_type = "image/png"
 
-            # save overlay image
             overlay_bgr = result["overlay_bgr"]
             ok = cv2.imwrite(str(out_path), overlay_bgr)
             if not ok:
@@ -165,7 +165,6 @@ async def predict(file: UploadFile = File(...), sample_every: int = 5):
         )
 
     except Exception as e:
-        # cleanup if failed
         in_path.unlink(missing_ok=True)
         out_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
@@ -173,7 +172,6 @@ async def predict(file: UploadFile = File(...), sample_every: int = 5):
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
-    # try video then image
     candidates = [
         OUT_DIR / f"{job_id}_heatmap.mp4",
         OUT_DIR / f"{job_id}_heatmap.png",
